@@ -1,0 +1,43 @@
+name: Deep Clean Videos Folder (from entire history)
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "yes" to confirm deep clean (irreversible!)'
+        required: true
+        default: 'no'
+
+permissions:
+  contents: write
+
+jobs:
+  deep-clean:
+    runs-on: ubuntu-latest
+    if: github.event.inputs.confirm == 'yes'
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # تمام تاریخچه را دریافت کن
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install git-filter-repo
+        run: |
+          sudo apt update
+          sudo apt install -y git-filter-repo
+
+      - name: Remove videos/ folder from entire history
+        run: |
+          git filter-repo --path videos/ --invert-paths --force
+
+      - name: Clean up and optimize repository
+        run: |
+          git reflog expire --expire=now --all
+          git gc --prune=now --aggressive
+
+      - name: Force push cleaned history
+        run: |
+          git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}
+          git push origin --force --all
+          git push origin --force --tags
