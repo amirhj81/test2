@@ -367,15 +367,15 @@ jobs:
                     [ -f "$DOWNLOADED_FILE" ] || continue
                     ACTUAL_HEIGHT=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$DOWNLOADED_FILE" 2>/dev/null || echo "unknown")
                     echo "Requested quality: ${QUALITY}p | Actual video height: ${ACTUAL_HEIGHT}px"
-                    if [ "$ACTUAL_HEIGHT" != "unknown" ] && [ "$ACTUAL_HEIGHT" -lt $(( QUALITY - 150 )) ] 2>/dev/null; then
-                      echo "⚠️  Method $METHOD delivered ${ACTUAL_HEIGHT}p instead of ${QUALITY}p — rejecting and trying next method..."
-                      QUALITY_OK=false
-                      rm -f "$DOWNLOADED_FILE"
-                    elif [ "$ACTUAL_HEIGHT" != "unknown" ] && [ "$ACTUAL_HEIGHT" -lt "$QUALITY" ] 2>/dev/null; then
-                      echo "⚠️  Requested ${QUALITY}p but got ${ACTUAL_HEIGHT}p (close enough, accepting)"
-                    else
-                      echo "✅ Quality check passed (${ACTUAL_HEIGHT}p)."
-                    fi
+                     if [ "$ACTUAL_HEIGHT" != "unknown" ] && [ "$ACTUAL_HEIGHT" -lt $(( QUALITY * 70 / 100 )) ] 2>/dev/null; then
+                    echo "⚠️  Method $METHOD delivered ${ACTUAL_HEIGHT}p, below minimum acceptable $(( QUALITY * 70 / 100 ))p (requested ${QUALITY}p) — rejecting and trying next method..."
+                    QUALITY_OK=false
+                    rm -f "$DOWNLOADED_FILE"
+                  elif [ "$ACTUAL_HEIGHT" != "unknown" ] && [ "$ACTUAL_HEIGHT" -lt "$QUALITY" ] 2>/dev/null; then
+                    echo "⚠️  Requested ${QUALITY}p but got ${ACTUAL_HEIGHT}p (within acceptable range, accepting)"
+                  else
+                    echo "✅ Quality check passed (${ACTUAL_HEIGHT}p)."
+                  fi
                   done
                 elif [ "$QUALITY" = "best" ]; then
                   for DOWNLOADED_FILE in "$TMP_DIR"/*.mp4 "$TMP_DIR"/*.webm "$TMP_DIR"/*.mkv; do
