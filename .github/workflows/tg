@@ -1,0 +1,137 @@
+name: 📥 Telegram Downloader (بدون نیاز به فعالسازی)
+
+on:
+  workflow_dispatch:
+    inputs:
+      telegram_link:
+        description: '🔗 لینک پست تلگرام (مثال: https://t.me/ChannelName/123)'
+        required: true
+        type: string
+      commit_to_repo:
+        description: 'آیا فایل‌ها در مخزن Git commit شوند؟ (فایل‌های باینری حجم repo را زیاد می‌کند)'
+        required: true
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+
+    steps:
+      - name: آماده‌سازی مخزن
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: بررسی و اعتبارسنجی لینک تلگرام
+        env:
+          TG_LINK: ${{ github.event.inputs.telegram_link }}
+        run: |
+          if [ -z "$TG_LINK" ]; then
+            echo "❌ لینک تلگرام وارد نشده است!"
+            exit 1
+          fi
+          
+          # اعتبارسنجی فرمت: https://t.me/ChannelName/123
+          if [[ ! "$TG_LINK" =~ ^https://t\.me/[a-zA-Z0-9_]+/[0-9]+$ ]]; then
+            echo "❌ فرمت لینک نامعتبر است."
+            echo "لینک باید دقیقاً به شکل https://t.me/ChannelName/123 باشد."
+            exit 1
+          fi
+          
+          echo "✅ لینک معتبر: $TG_LINK"
+
+      - name: نصب وابستگی‌ها
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq python3-pip ffmpeg
+          pip3 install --upgrade --quiet yt-dlp
+
+      - name: دانلود محتوا از تلگرام
+        id: download
+        env:
+          TG_LINK: ${{ github.event.inputs.telegram_link }}
+        run: |
+          echo "🚀 شروع دانلود از: $TG_LINK"
+
+          # پاک‌سازی پوشه قبلی (در صورت اجرای مجدد)
+          rm -rf downloads
+          mkdir -p downloads
+
+          # استخراج اطلاعات پست (اختیاری، برای دیباگ)
+          echo "📋 در حال استخراج اطلاعات پست..."
+          yt-dlp --dump-json --quiet "$TG_LINK" > downloads/post_info.json 2>/dev/null || true
+
+          # دانلود با yt-dlp
+          # %(id)s = شماره پست تلگرام / %(ext)s = پسوند فایل
+          yt-dlp \
+            --no-overwrites \
+            --output "downloads/%(title)s [%(id)s].%(ext)s" \
+            --write-info-json \
+            --write-thumbnail \
+            --embed-thumbnail \
+            --embed-metadata \
+            --retries 10 \
+            --fragment-retries 10 \
+            --buffer-size 16K \
+            "$TG_LINK"
+
+          # بررسی موفقیت دانلود
+          FILE_COUNT=$(find downloads -type f ! -name "*.json" | wc -l)
+          if [ "$FILE_COUNT" -eq 0 ]; then
+            echo "❌ هیچ فایل رسانه‌ای دانلود نشد. احتمالاً:"
+            echo "   • پست خصوصی است"
+            echo "   • محتوا حذف شده است"
+            echo "   • yt-dlp از این فرمت پشتیبانی نمی‌کند"
+            exit 1
+          fi
+          
+          echo "✅ دانلود با موفقیت انجام شد. تعداد فایل‌ها: $FILE_COUNT"
+          ls -lh downloads/
+
+      - name: آپلود فایل‌ها به‌عنوان Artifact (پیش‌فرض)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: telegram-download-${{ github.run_id }}
+          path: downloads/
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: commit و push فایل‌ها به مخزن (اختیاری)
+        if: github.event.inputs.commit_to_repo == 'true'
+        env:
+          TG_LINK: ${{ github.event.inputs.telegram_link }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # فقط فایل‌های رسانه‌ای را اضافه کن (نه فایل‌های json دیباگ)
+          git add downloads/
+          
+          if git diff --cached --quiet; then
+            echo "⚠️ هیچ تغییری برای commit وجود ندارد."
+          else
+            git commit -m "📥 دانلود خودکار از تلگرام: $TG_LINK"
+            git push
+            echo "✅ فایل‌ها به مخزن push شدند."
+          fi
+
+      - name: نمایش نتیجه نهایی
+        if: always()
+        env:
+          TG_LINK: ${{ github.event.inputs.telegram_link }}
+        run: |
+          echo ""
+          echo "========================================="
+          echo "🎉 فرآیند دانلود پایان یافت."
+          echo "🔗 لینک: $TG_LINK"
+          echo "📁 فایل‌ها در Artifact ذخیره شدند:"
+          echo "   → telegram-download-${{ github.run_id }}"
+          echo "========================================="
