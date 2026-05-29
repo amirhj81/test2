@@ -1,4 +1,4 @@
-name: 📥 Telegram Downloader (بدون نیاز به فعالسازی)
+name: 📥 TG
 
 on:
   workflow_dispatch:
