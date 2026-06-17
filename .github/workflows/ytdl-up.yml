@@ -22,7 +22,7 @@ on:
           - 360p
           - audio-only
       subtitles:
-        description: 'Subtitles language (fa, en, both, none)'
+        description: 'Subtitles language (fa, en, both, none) - Soft subs (separate files)'
         required: false
         default: 'none'
         type: choice
@@ -72,11 +72,15 @@ jobs:
             PASSWORD="${{ github.event.inputs.password }}"
           else
             BODY="${{ github.event.issue.body }}"
+            # Extract URL
             URL=$(echo "$BODY" | grep -oP 'https?://(www\.)?(youtube\.com|youtu\.be)/[^\s]+' | head -1)
+            # Extract quality (default: best)
             QUALITY=$(echo "$BODY" | grep -i 'quality:' | sed 's/.*quality:\s*//i' | tr -d ' ' | head -1)
             QUALITY=${QUALITY:-best}
+            # Extract subtitles (default: none)
             SUBS=$(echo "$BODY" | grep -i 'subs:' | sed 's/.*subs:\s*//i' | tr -d ' ' | head -1)
             SUBS=${SUBS:-none}
+            # Extract password (default: empty)
             PASSWORD=$(echo "$BODY" | grep -i 'password:' | sed 's/.*password:\s*//i' | head -1)
           fi
 
@@ -86,7 +90,7 @@ jobs:
           echo "password=$PASSWORD" >> $GITHUB_OUTPUT
           echo "URL: $URL, Quality: $QUALITY, Subs: $SUBS, Password: ${PASSWORD:+set}"
 
-      - name: Download YouTube video(s) with multiple cookies
+      - name: Download YouTube video(s) with multiple cookies and soft subtitles
         run: |
           mkdir -p downloads
           cd downloads
@@ -96,18 +100,31 @@ jobs:
           SUBS="${{ steps.params.outputs.subs }}"
           COOKIE_COUNT="${{ env.COOKIE_COUNT }}"
 
-          # ===== 1. Extract video URLs =====
+          # ===== 1. Extract video URLs (handles playlists) =====
+          echo "Extracting video URLs from: $URL"
           yt-dlp --flat-playlist --dump-json "$URL" > playlist_info.json
+
           if jq -e '.entries' playlist_info.json > /dev/null; then
+            # It's a playlist
             jq -r '.entries[].url' playlist_info.json > video_urls.txt
+            PLAYLIST_TITLE=$(jq -r '.playlist_title' playlist_info.json)
+            echo "Playlist detected: $PLAYLIST_TITLE"
           else
+            # Single video
             echo "$URL" > video_urls.txt
+            PLAYLIST_TITLE=$(jq -r '.title' playlist_info.json)
+            echo "Single video: $PLAYLIST_TITLE"
           fi
+
           mapfile -t VIDEO_URLS < video_urls.txt
           TOTAL_VIDEOS=${#VIDEO_URLS[@]}
-          echo "Total videos: $TOTAL_VIDEOS"
+          echo "Total videos to download: $TOTAL_VIDEOS"
 
-          # ===== 2. Load cookies from env =====
+          # Save playlist title for email
+          echo "PLAYLIST_TITLE=$PLAYLIST_TITLE" >> $GITHUB_ENV
+
+          # ===== 2. Load cookies from environment =====
+          echo "Loading cookies from secrets..."
           for i in $(seq 1 $COOKIE_COUNT); do
             COOKIE_VAR="YOUTUBE_COOKIE_$i"
             COOKIE_VALUE="${!COOKIE_VAR}"
@@ -115,20 +132,21 @@ jobs:
               echo "$COOKIE_VALUE" > "cookie_$i.txt"
               echo "✅ Loaded cookie $i"
             else
-              echo "⚠️ Secret $COOKIE_VAR is empty"
+              echo "⚠️ Secret $COOKIE_VAR is empty or not set"
             fi
           done
 
           COOKIE_LOADED=$(ls cookie_*.txt 2>/dev/null | wc -l)
           if [ "$COOKIE_LOADED" -eq 0 ]; then
-            echo "❌ No cookies loaded!"
+            echo "❌ No cookies loaded! Please set at least one YOUTUBE_COOKIE_N secret."
             exit 1
           fi
-          echo "Loaded $COOKIE_LOADED cookies"
+          echo "Loaded $COOKIE_LOADED cookie files."
 
-          # ===== 3. Build base command =====
+          # ===== 3. Build base yt-dlp command =====
           BASE_CMD="yt-dlp --restrict-filenames -o \"%(title)s.%(ext)s\""
 
+          # Quality selection
           if [ "$QUALITY" == "audio-only" ]; then
             BASE_CMD="$BASE_CMD -x --audio-format mp3 --audio-quality 0"
             FORMAT_EXT="mp3"
@@ -143,78 +161,132 @@ jobs:
             BASE_CMD="$BASE_CMD -f \"$FORMAT\" --merge-output-format mp4"
             FORMAT_EXT="mp4"
 
+            # Subtitles - Soft subs (separate files, not embedded)
             case "$SUBS" in
-              "fa")   BASE_CMD="$BASE_CMD --write-subs --sub-langs fa --embed-subs" ;;
-              "en")   BASE_CMD="$BASE_CMD --write-subs --sub-langs en --embed-subs" ;;
-              "both") BASE_CMD="$BASE_CMD --write-subs --sub-langs fa,en --embed-subs" ;;
-              *)      ;;
+              "fa")
+                BASE_CMD="$BASE_CMD --write-subs --sub-langs fa --skip-download"
+                ;;
+              "en")
+                BASE_CMD="$BASE_CMD --write-subs --sub-langs en --skip-download"
+                ;;
+              "both")
+                BASE_CMD="$BASE_CMD --write-subs --sub-langs fa,en --skip-download"
+                ;;
+              *)
+                # No subtitles
+                ;;
             esac
           fi
 
           # ===== 4. Download each video with rotating cookie =====
           COOKIE_INDEX=0
+          SUCCESS_COUNT=0
+          FAIL_COUNT=0
+
           for VIDEO_URL in "${VIDEO_URLS[@]}"; do
+            # Select cookie (round-robin)
             COOKIE_NUM=$(( (COOKIE_INDEX % COOKIE_LOADED) + 1 ))
             COOKIE_FILE="cookie_$COOKIE_NUM.txt"
             COOKIE_INDEX=$((COOKIE_INDEX + 1))
 
+            echo "=========================================="
             echo "Downloading video $COOKIE_INDEX/$TOTAL_VIDEOS using cookie $COOKIE_NUM"
+            echo "URL: $VIDEO_URL"
+
+            # Build full command for this video
             CMD="$BASE_CMD --cookies \"$COOKIE_FILE\" \"$VIDEO_URL\""
+
             echo "Running: $CMD"
             eval $CMD
+
+            if [ $? -eq 0 ]; then
+              SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+              echo "✅ Download successful"
+            else
+              FAIL_COUNT=$((FAIL_COUNT + 1))
+              echo "❌ Download failed for $VIDEO_URL"
+            fi
+
+            echo "=========================================="
           done
 
-          # Cleanup
-          rm -f cookie_*.txt playlist_info.json video_urls.txt
+          echo "Download summary: $SUCCESS_COUNT succeeded, $FAIL_COUNT failed"
 
-          # ===== 5. Metadata =====
-          yt-dlp --flat-playlist --dump-single-json "$URL" > info.json
-          PLAYLIST_TITLE=$(jq -r '.playlist_title // .title' info.json)
-          echo "PLAYLIST_TITLE=$PLAYLIST_TITLE" >> $GITHUB_ENV
-
-          VIDEO_COUNT=$(jq -r '.entries | length' info.json)
-          if [ "$VIDEO_COUNT" == "null" ] || [ -z "$VIDEO_COUNT" ]; then
-            VIDEO_COUNT=1
-          fi
+          # ===== 5. Count videos for email =====
+          VIDEO_COUNT=$TOTAL_VIDEOS
           echo "VIDEO_COUNT=$VIDEO_COUNT" >> $GITHUB_ENV
           echo "FORMAT_EXT=$FORMAT_EXT" >> $GITHUB_ENV
+          echo "SUBTITLES_ENABLED=$SUBS" >> $GITHUB_ENV
 
-          echo "Download completed."
+          # Clean up cookie files
+          rm -f cookie_*.txt playlist_info.json video_urls.txt
 
-      - name: Split large files into parts (max ${{ env.MAX_PART_SIZE_MB }} MB each)
+          echo "Download phase completed."
+
+      - name: Split large files into parts (max ${{ env.MAX_PART_SIZE_MB }} MB each) with optional password
         run: |
           cd downloads
           PASSWORD="${{ steps.params.outputs.password }}"
           EXT="${{ env.FORMAT_EXT }}"
+          SUBS="${{ steps.params.outputs.subs }}"
+
+          # Find all video/audio files
           for file in *.$EXT; do
             if [ -f "$file" ]; then
-              SIZE_MB=$(du -m "$file" | cut -f1)
               BASENAME="${file%.*}"
+              echo "Processing: $file"
+
+              # Check if there are subtitle files for this video
+              SUB_FILES=""
+              if [ "$SUBS" != "none" ] && [ "$EXT" != "mp3" ]; then
+                # Find subtitle files with same basename
+                for sub_ext in srt vtt; do
+                  if [ -f "${BASENAME}.${sub_ext}" ]; then
+                    SUB_FILES="$SUB_FILES ${BASENAME}.${sub_ext}"
+                  fi
+                  # Also check for language-specific subs (e.g., .fa.srt, .en.vtt)
+                  for lang in fa en; do
+                    if [ -f "${BASENAME}.${lang}.${sub_ext}" ]; then
+                      SUB_FILES="$SUB_FILES ${BASENAME}.${lang}.${sub_ext}"
+                    fi
+                  done
+                done
+              fi
+
+              # Calculate size of all files to be archived
+              SIZE_MB=$(du -m "$file" $SUB_FILES 2>/dev/null | awk '{sum+=$1} END {print sum}')
+              SIZE_MB=${SIZE_MB:-0}
+
               if [ $SIZE_MB -gt ${{ env.MAX_PART_SIZE_MB }} ]; then
-                echo "File $file exceeds size limit, splitting..."
+                echo "File(s) exceed size limit, splitting..."
                 if [ -n "$PASSWORD" ]; then
-                  7z a -v${{ env.MAX_PART_SIZE_MB }}m -p"$PASSWORD" "${BASENAME}.7z" "$file"
+                  7z a -v${{ env.MAX_PART_SIZE_MB }}m -p"$PASSWORD" "${BASENAME}.7z" "$file" $SUB_FILES
                 else
-                  7z a -v${{ env.MAX_PART_SIZE_MB }}m "${BASENAME}.7z" "$file"
+                  7z a -v${{ env.MAX_PART_SIZE_MB }}m "${BASENAME}.7z" "$file" $SUB_FILES
                 fi
-                rm "$file"
+                rm -f "$file" $SUB_FILES
               else
-                echo "File $file is within limit, compressing with 7z..."
+                echo "File(s) are within limit, compressing with 7z..."
                 if [ -n "$PASSWORD" ]; then
-                  7z a -p"$PASSWORD" "${BASENAME}.7z" "$file"
+                  7z a -p"$PASSWORD" "${BASENAME}.7z" "$file" $SUB_FILES
                 else
-                  7z a "${BASENAME}.7z" "$file"
+                  7z a "${BASENAME}.7z" "$file" $SUB_FILES
                 fi
-                rm "$file"
+                rm -f "$file" $SUB_FILES
               fi
             fi
           done
 
-      - name: Upload each part to Ufile.io
+          # Clean up any remaining subtitle files (just in case)
+          rm -f *.srt *.vtt
+
+      - name: Upload each part to Ufile.io and collect links
         id: upload
         run: |
           cd downloads
           > upload_info.txt
+          TOTAL_UPLOADED=0
+
           for archive in *.7z*; do
             if [ -f "$archive" ]; then
               echo "Uploading $archive ..."
@@ -224,15 +296,18 @@ jobs:
                 SIZE=$(du -h "$archive" | cut -f1)
                 echo "$archive (Size: $SIZE): $LINK" >> upload_info.txt
                 echo "✅ Uploaded: $LINK"
+                TOTAL_UPLOADED=$((TOTAL_UPLOADED + 1))
               else
                 echo "❌ Failed to upload $archive"
                 echo "Server response: $RESPONSE"
               fi
             fi
           done
+
+          echo "TOTAL_UPLOADED=$TOTAL_UPLOADED" >> $GITHUB_ENV
           cat upload_info.txt
 
-      - name: Prepare email body
+      - name: Prepare email body with full details
         id: email_body
         run: |
           cd downloads
@@ -243,6 +318,7 @@ jobs:
           QUALITY="${{ steps.params.outputs.quality }}"
           SUBS="${{ steps.params.outputs.subs }}"
           FORMAT_EXT="${{ env.FORMAT_EXT }}"
+          TOTAL_UPLOADED="${{ env.TOTAL_UPLOADED }}"
 
           BODY="Hello,\n\n"
           BODY+="Your YouTube download has been completed successfully.\n"
@@ -254,7 +330,11 @@ jobs:
             BODY+="🎵 Format: Audio Only (MP3)\n"
           else
             BODY+="🎬 Quality: $QUALITY\n"
-            BODY+="🔤 Subtitles: $SUBS\n"
+            if [ "$SUBS" != "none" ]; then
+              BODY+="🔤 Subtitles: $SUBS (Soft subs - separate files included in archives)\n"
+            else
+              BODY+="🔤 Subtitles: None\n"
+            fi
           fi
           if [ -n "$PASSWORD" ]; then
             BODY+="🔒 Password: $PASSWORD (required to extract the archives)\n"
@@ -266,10 +346,13 @@ jobs:
           while IFS= read -r line; do
             BODY+="$line\n"
           done < upload_info.txt
-          BODY+="\n⏳ These links are valid for 30 days.\n"
+          BODY+="\n⏳ These links are valid for 30 days (Ufile.io).\n"
           BODY+="💡 To extract: If you have multiple parts (e.g., .7z.001, .7z.002), use:\n"
-          BODY+="   7z x file.7z.001 -pPASSWORD (if password set)\n\n"
-          BODY+="Regards,\nYouTube Downloader Bot"
+          BODY+="   7z x file.7z.001 -pPASSWORD (if password set)\n"
+          if [ "$SUBS" != "none" ] && [ "$QUALITY" != "audio-only" ]; then
+            BODY+="📝 Subtitle files are included as separate .srt or .vtt files inside the archive.\n"
+          fi
+          BODY+="\nRegards,\nYouTube Downloader Bot"
 
           echo -e "$BODY" > email_body.txt
           cat email_body.txt
@@ -294,5 +377,12 @@ jobs:
         uses: peter-evans/close-issue@v3
         with:
           comment: |
-            ✅ Download and upload completed successfully.
+            ✅ Download and upload completed successfully!
+            
+            📌 **Playlist/Video:** ${{ env.PLAYLIST_TITLE }}
+            📂 **Number of videos:** ${{ env.VIDEO_COUNT }}
+            📦 **Parts uploaded:** ${{ env.TOTAL_UPLOADED }}
+            
             All download links have been sent to your email address.
+            
+            🔗 Check your email for the download links.
