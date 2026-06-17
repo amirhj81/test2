@@ -45,6 +45,12 @@ jobs:
       MAX_PART_SIZE_MB: 2500
       UFILE_API: 'https://upload.ufile.io/'
       RECIPIENT_EMAIL: ${{ github.event.issue.user.email || github.actor }}@users.noreply.github.com
+      COOKIE_COUNT: 3  # ← تعداد کوکی‌هایی که دارید را وارد کنید
+      # Secretهای کوکی را به محیط منتقل کنید
+      YOUTUBE_COOKIE_1: ${{ secrets.YOUTUBE_COOKIE_1 }}
+      YOUTUBE_COOKIE_2: ${{ secrets.YOUTUBE_COOKIE_2 }}
+      YOUTUBE_COOKIE_3: ${{ secrets.YOUTUBE_COOKIE_3 }}
+      # در صورت نیاز، تا ۱۰ یا ۲۰ عدد اضافه کنید
 
     steps:
       - name: Checkout repository
@@ -66,15 +72,11 @@ jobs:
             PASSWORD="${{ github.event.inputs.password }}"
           else
             BODY="${{ github.event.issue.body }}"
-            # Extract URL
             URL=$(echo "$BODY" | grep -oP 'https?://(www\.)?(youtube\.com|youtu\.be)/[^\s]+' | head -1)
-            # Extract quality (default: best)
             QUALITY=$(echo "$BODY" | grep -i 'quality:' | sed 's/.*quality:\s*//i' | tr -d ' ' | head -1)
             QUALITY=${QUALITY:-best}
-            # Extract subtitles (default: none)
             SUBS=$(echo "$BODY" | grep -i 'subs:' | sed 's/.*subs:\s*//i' | tr -d ' ' | head -1)
             SUBS=${SUBS:-none}
-            # Extract password (default: empty)
             PASSWORD=$(echo "$BODY" | grep -i 'password:' | sed 's/.*password:\s*//i' | head -1)
           fi
 
@@ -84,7 +86,7 @@ jobs:
           echo "password=$PASSWORD" >> $GITHUB_OUTPUT
           echo "URL: $URL, Quality: $QUALITY, Subs: $SUBS, Password: ${PASSWORD:+set}"
 
-      - name: Download YouTube video(s) with selected quality and subtitles
+      - name: Download YouTube video(s) with multiple cookies
         run: |
           mkdir -p downloads
           cd downloads
@@ -92,16 +94,45 @@ jobs:
           URL="${{ steps.params.outputs.url }}"
           QUALITY="${{ steps.params.outputs.quality }}"
           SUBS="${{ steps.params.outputs.subs }}"
+          COOKIE_COUNT="${{ env.COOKIE_COUNT }}"
 
-          # Base command
-          CMD="yt-dlp --restrict-filenames -o \"%(title)s.%(ext)s\""
+          # ===== 1. Extract video URLs =====
+          yt-dlp --flat-playlist --dump-json "$URL" > playlist_info.json
+          if jq -e '.entries' playlist_info.json > /dev/null; then
+            jq -r '.entries[].url' playlist_info.json > video_urls.txt
+          else
+            echo "$URL" > video_urls.txt
+          fi
+          mapfile -t VIDEO_URLS < video_urls.txt
+          TOTAL_VIDEOS=${#VIDEO_URLS[@]}
+          echo "Total videos: $TOTAL_VIDEOS"
+
+          # ===== 2. Load cookies from env =====
+          for i in $(seq 1 $COOKIE_COUNT); do
+            COOKIE_VAR="YOUTUBE_COOKIE_$i"
+            COOKIE_VALUE="${!COOKIE_VAR}"
+            if [ -n "$COOKIE_VALUE" ]; then
+              echo "$COOKIE_VALUE" > "cookie_$i.txt"
+              echo "✅ Loaded cookie $i"
+            else
+              echo "⚠️ Secret $COOKIE_VAR is empty"
+            fi
+          done
+
+          COOKIE_LOADED=$(ls cookie_*.txt 2>/dev/null | wc -l)
+          if [ "$COOKIE_LOADED" -eq 0 ]; then
+            echo "❌ No cookies loaded!"
+            exit 1
+          fi
+          echo "Loaded $COOKIE_LOADED cookies"
+
+          # ===== 3. Build base command =====
+          BASE_CMD="yt-dlp --restrict-filenames -o \"%(title)s.%(ext)s\""
 
           if [ "$QUALITY" == "audio-only" ]; then
-            # Audio-only mode
-            CMD="$CMD -x --audio-format mp3 --audio-quality 0"
+            BASE_CMD="$BASE_CMD -x --audio-format mp3 --audio-quality 0"
             FORMAT_EXT="mp3"
           else
-            # Video mode: set format based on quality
             case "$QUALITY" in
               "1080p") FORMAT="bestvideo[height<=1080]+bestaudio/best[height<=1080]" ;;
               "720p")  FORMAT="bestvideo[height<=720]+bestaudio/best[height<=720]" ;;
@@ -109,31 +140,38 @@ jobs:
               "360p")  FORMAT="bestvideo[height<=360]+bestaudio/best[height<=360]" ;;
               *)       FORMAT="bestvideo+bestaudio" ;;
             esac
-            CMD="$CMD -f \"$FORMAT\" --merge-output-format mp4"
+            BASE_CMD="$BASE_CMD -f \"$FORMAT\" --merge-output-format mp4"
             FORMAT_EXT="mp4"
 
-            # Add subtitles (if not audio-only)
             case "$SUBS" in
-              "fa")   CMD="$CMD --write-subs --sub-langs fa --embed-subs" ;;
-              "en")   CMD="$CMD --write-subs --sub-langs en --embed-subs" ;;
-              "both") CMD="$CMD --write-subs --sub-langs fa,en --embed-subs" ;;
-              *)      ;; # none
+              "fa")   BASE_CMD="$BASE_CMD --write-subs --sub-langs fa --embed-subs" ;;
+              "en")   BASE_CMD="$BASE_CMD --write-subs --sub-langs en --embed-subs" ;;
+              "both") BASE_CMD="$BASE_CMD --write-subs --sub-langs fa,en --embed-subs" ;;
+              *)      ;;
             esac
           fi
 
-          # Add URL (no extra playlist flag needed)
-          CMD="$CMD \"$URL\""
+          # ===== 4. Download each video with rotating cookie =====
+          COOKIE_INDEX=0
+          for VIDEO_URL in "${VIDEO_URLS[@]}"; do
+            COOKIE_NUM=$(( (COOKIE_INDEX % COOKIE_LOADED) + 1 ))
+            COOKIE_FILE="cookie_$COOKIE_NUM.txt"
+            COOKIE_INDEX=$((COOKIE_INDEX + 1))
 
-          echo "Running: $CMD"
-          eval $CMD
+            echo "Downloading video $COOKIE_INDEX/$TOTAL_VIDEOS using cookie $COOKIE_NUM"
+            CMD="$BASE_CMD --cookies \"$COOKIE_FILE\" \"$VIDEO_URL\""
+            echo "Running: $CMD"
+            eval $CMD
+          done
 
-          # Get playlist or video metadata
+          # Cleanup
+          rm -f cookie_*.txt playlist_info.json video_urls.txt
+
+          # ===== 5. Metadata =====
           yt-dlp --flat-playlist --dump-single-json "$URL" > info.json
-
           PLAYLIST_TITLE=$(jq -r '.playlist_title // .title' info.json)
           echo "PLAYLIST_TITLE=$PLAYLIST_TITLE" >> $GITHUB_ENV
 
-          # Count total videos in playlist (or 1 for single video)
           VIDEO_COUNT=$(jq -r '.entries | length' info.json)
           if [ "$VIDEO_COUNT" == "null" ] || [ -z "$VIDEO_COUNT" ]; then
             VIDEO_COUNT=1
@@ -143,7 +181,7 @@ jobs:
 
           echo "Download completed."
 
-      - name: Split large files into parts (max ${{ env.MAX_PART_SIZE_MB }} MB each) with optional password
+      - name: Split large files into parts (max ${{ env.MAX_PART_SIZE_MB }} MB each)
         run: |
           cd downloads
           PASSWORD="${{ steps.params.outputs.password }}"
@@ -172,7 +210,7 @@ jobs:
             fi
           done
 
-      - name: Upload each part to Ufile.io and collect links
+      - name: Upload each part to Ufile.io
         id: upload
         run: |
           cd downloads
@@ -194,7 +232,7 @@ jobs:
           done
           cat upload_info.txt
 
-      - name: Prepare email body (English) with full details
+      - name: Prepare email body
         id: email_body
         run: |
           cd downloads
@@ -258,6 +296,3 @@ jobs:
           comment: |
             ✅ Download and upload completed successfully.
             All download links have been sent to your email address.
-            Playlist/Video: ${{ env.PLAYLIST_TITLE }}
-            Format: ${{ env.FORMAT_EXT == 'mp3' && 'Audio Only' || 'Video' }}
-            Total parts: (see email)
