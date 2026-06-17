@@ -10,7 +10,7 @@ on:
         required: true
         default: 'https://www.youtube.com/watch?v=...'
       quality:
-        description: 'Video quality (best, 1080p, 720p, 480p)'
+        description: 'Video quality (best, 1080p, 720p, 480p, 360p, audio-only)'
         required: false
         default: 'best'
         type: choice
@@ -19,6 +19,8 @@ on:
           - 1080p
           - 720p
           - 480p
+          - 360p
+          - audio-only
       subtitles:
         description: 'Subtitles language (fa, en, both, none)'
         required: false
@@ -91,45 +93,37 @@ jobs:
           QUALITY="${{ steps.params.outputs.quality }}"
           SUBS="${{ steps.params.outputs.subs }}"
 
-          # Build yt-dlp command
-          CMD="yt-dlp -f bestvideo+bestaudio --merge-output-format mp4 --restrict-filenames -o \"%(title)s.%(ext)s\""
+          # Base command
+          CMD="yt-dlp --restrict-filenames -o \"%(title)s.%(ext)s\""
 
-          # Quality selection
-          case "$QUALITY" in
-            "1080p")
-              CMD="$CMD -f 'bestvideo[height<=1080]+bestaudio/best[height<=1080]'"
-              ;;
-            "720p")
-              CMD="$CMD -f 'bestvideo[height<=720]+bestaudio/best[height<=720]'"
-              ;;
-            "480p")
-              CMD="$CMD -f 'bestvideo[height<=480]+bestaudio/best[height<=480]'"
-              ;;
-            *)
-              CMD="$CMD -f bestvideo+bestaudio"
-              ;;
-          esac
+          if [ "$QUALITY" == "audio-only" ]; then
+            # Audio-only mode
+            CMD="$CMD -x --audio-format mp3 --audio-quality 0"
+            FORMAT_EXT="mp3"
+          else
+            # Video mode: set format based on quality
+            case "$QUALITY" in
+              "1080p") FORMAT="bestvideo[height<=1080]+bestaudio/best[height<=1080]" ;;
+              "720p")  FORMAT="bestvideo[height<=720]+bestaudio/best[height<=720]" ;;
+              "480p")  FORMAT="bestvideo[height<=480]+bestaudio/best[height<=480]" ;;
+              "360p")  FORMAT="bestvideo[height<=360]+bestaudio/best[height<=360]" ;;
+              *)       FORMAT="bestvideo+bestaudio" ;;
+            esac
+            CMD="$CMD -f \"$FORMAT\" --merge-output-format mp4"
+            FORMAT_EXT="mp4"
 
-          # Subtitles
-          case "$SUBS" in
-            "fa")
-              CMD="$CMD --write-subs --sub-langs fa --embed-subs"
-              ;;
-            "en")
-              CMD="$CMD --write-subs --sub-langs en --embed-subs"
-              ;;
-            "both")
-              CMD="$CMD --write-subs --sub-langs fa,en --embed-subs"
-              ;;
-            *)
-              # no subtitles
-              ;;
-          esac
+            # Add subtitles (if not audio-only)
+            case "$SUBS" in
+              "fa")   CMD="$CMD --write-subs --sub-langs fa --embed-subs" ;;
+              "en")   CMD="$CMD --write-subs --sub-langs en --embed-subs" ;;
+              "both") CMD="$CMD --write-subs --sub-langs fa,en --embed-subs" ;;
+              *)      ;; # none
+            esac
+          fi
 
-          # Add playlist handling
-          CMD="$CMD --no-playlist-if-no-url \"$URL\""
+          # Add URL (no extra playlist flag needed)
+          CMD="$CMD \"$URL\""
 
-          # Execute
           echo "Running: $CMD"
           eval $CMD
 
@@ -145,6 +139,7 @@ jobs:
             VIDEO_COUNT=1
           fi
           echo "VIDEO_COUNT=$VIDEO_COUNT" >> $GITHUB_ENV
+          echo "FORMAT_EXT=$FORMAT_EXT" >> $GITHUB_ENV
 
           echo "Download completed."
 
@@ -152,7 +147,8 @@ jobs:
         run: |
           cd downloads
           PASSWORD="${{ steps.params.outputs.password }}"
-          for file in *.mp4; do
+          EXT="${{ env.FORMAT_EXT }}"
+          for file in *.$EXT; do
             if [ -f "$file" ]; then
               SIZE_MB=$(du -m "$file" | cut -f1)
               BASENAME="${file%.*}"
@@ -187,7 +183,6 @@ jobs:
               RESPONSE=$(curl -s -F "file=@$archive" ${{ env.UFILE_API }})
               LINK=$(echo "$RESPONSE" | jq -r '.data.url // empty')
               if [ -n "$LINK" ]; then
-                # Get file size
                 SIZE=$(du -h "$archive" | cut -f1)
                 echo "$archive (Size: $SIZE): $LINK" >> upload_info.txt
                 echo "✅ Uploaded: $LINK"
@@ -197,7 +192,6 @@ jobs:
               fi
             fi
           done
-          # Save for later
           cat upload_info.txt
 
       - name: Prepare email body (English) with full details
@@ -210,6 +204,7 @@ jobs:
           PASSWORD="${{ steps.params.outputs.password }}"
           QUALITY="${{ steps.params.outputs.quality }}"
           SUBS="${{ steps.params.outputs.subs }}"
+          FORMAT_EXT="${{ env.FORMAT_EXT }}"
 
           BODY="Hello,\n\n"
           BODY+="Your YouTube download has been completed successfully.\n"
@@ -217,8 +212,12 @@ jobs:
           BODY+="📌 Playlist / Video Title: $PLAYLIST_TITLE\n"
           BODY+="📂 Number of videos: $VIDEO_COUNT\n"
           BODY+="📦 Total parts uploaded: $TOTAL_PARTS\n"
-          BODY+="🎬 Quality: $QUALITY\n"
-          BODY+="🔤 Subtitles: $SUBS\n"
+          if [ "$QUALITY" == "audio-only" ]; then
+            BODY+="🎵 Format: Audio Only (MP3)\n"
+          else
+            BODY+="🎬 Quality: $QUALITY\n"
+            BODY+="🔤 Subtitles: $SUBS\n"
+          fi
           if [ -n "$PASSWORD" ]; then
             BODY+="🔒 Password: $PASSWORD (required to extract the archives)\n"
           else
@@ -260,4 +259,5 @@ jobs:
             ✅ Download and upload completed successfully.
             All download links have been sent to your email address.
             Playlist/Video: ${{ env.PLAYLIST_TITLE }}
+            Format: ${{ env.FORMAT_EXT == 'mp3' && 'Audio Only' || 'Video' }}
             Total parts: (see email)
