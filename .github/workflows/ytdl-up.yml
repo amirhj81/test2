@@ -2,25 +2,50 @@ name: Download YouTube & Upload to Ufile
 
 on:
   issues:
-    types: [opened]  # Triggered when a new issue is opened
-  workflow_dispatch:  # Manual trigger from Actions tab
+    types: [opened]
+  workflow_dispatch:
     inputs:
       url:
         description: 'YouTube video or playlist URL'
         required: true
         default: 'https://www.youtube.com/watch?v=...'
+      quality:
+        description: 'Video quality (best, 1080p, 720p, 480p)'
+        required: false
+        default: 'best'
+        type: choice
+        options:
+          - best
+          - 1080p
+          - 720p
+          - 480p
+      subtitles:
+        description: 'Subtitles language (fa, en, both, none)'
+        required: false
+        default: 'none'
+        type: choice
+        options:
+          - none
+          - fa
+          - en
+          - both
+      password:
+        description: 'Password for 7z archive (leave empty for no password)'
+        required: false
+        default: ''
+        type: string
 
 jobs:
   download-and-upload:
     runs-on: ubuntu-latest
     if: github.event_name == 'workflow_dispatch' || contains(github.event.issue.title, 'youtube')
     env:
-      MAX_PART_SIZE_MB: 2500   # Max size per part (2.5 GB)
-      UFILE_API: 'https://upload.ufile.io/'   # Ufile upload API endpoint
+      MAX_PART_SIZE_MB: 2500
+      UFILE_API: 'https://upload.ufile.io/'
       RECIPIENT_EMAIL: ${{ github.event.issue.user.email || github.actor }}@users.noreply.github.com
 
     steps:
-      - name: Checkout repository (no upload to GitHub)
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Install required tools
@@ -29,70 +54,142 @@ jobs:
           sudo apt install -y python3-pip p7zip-full jq curl
           pip3 install yt-dlp
 
-      - name: Extract YouTube URL from issue or input
-        id: get_url
+      - name: Extract parameters from issue (if triggered by issue)
+        id: params
         run: |
           if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
             URL="${{ github.event.inputs.url }}"
+            QUALITY="${{ github.event.inputs.quality }}"
+            SUBS="${{ github.event.inputs.subtitles }}"
+            PASSWORD="${{ github.event.inputs.password }}"
           else
-            URL=$(echo "${{ github.event.issue.body }}" | grep -oP 'https?://(www\.)?(youtube\.com|youtu\.be)/[^\s]+' | head -1)
+            BODY="${{ github.event.issue.body }}"
+            # Extract URL
+            URL=$(echo "$BODY" | grep -oP 'https?://(www\.)?(youtube\.com|youtu\.be)/[^\s]+' | head -1)
+            # Extract quality (default: best)
+            QUALITY=$(echo "$BODY" | grep -i 'quality:' | sed 's/.*quality:\s*//i' | tr -d ' ' | head -1)
+            QUALITY=${QUALITY:-best}
+            # Extract subtitles (default: none)
+            SUBS=$(echo "$BODY" | grep -i 'subs:' | sed 's/.*subs:\s*//i' | tr -d ' ' | head -1)
+            SUBS=${SUBS:-none}
+            # Extract password (default: empty)
+            PASSWORD=$(echo "$BODY" | grep -i 'password:' | sed 's/.*password:\s*//i' | head -1)
           fi
-          echo "url=$URL" >> $GITHUB_OUTPUT
-          echo "URL: $URL"
 
-      - name: Download video(s) from YouTube and get metadata
+          echo "url=$URL" >> $GITHUB_OUTPUT
+          echo "quality=$QUALITY" >> $GITHUB_OUTPUT
+          echo "subs=$SUBS" >> $GITHUB_OUTPUT
+          echo "password=$PASSWORD" >> $GITHUB_OUTPUT
+          echo "URL: $URL, Quality: $QUALITY, Subs: $SUBS, Password: ${PASSWORD:+set}"
+
+      - name: Download YouTube video(s) with selected quality and subtitles
         run: |
           mkdir -p downloads
           cd downloads
 
-          URL="${{ steps.get_url.outputs.url }}"
+          URL="${{ steps.params.outputs.url }}"
+          QUALITY="${{ steps.params.outputs.quality }}"
+          SUBS="${{ steps.params.outputs.subs }}"
 
-          # Get playlist/video metadata (single JSON for playlist or video)
+          # Build yt-dlp command
+          CMD="yt-dlp -f bestvideo+bestaudio --merge-output-format mp4 --restrict-filenames -o \"%(title)s.%(ext)s\""
+
+          # Quality selection
+          case "$QUALITY" in
+            "1080p")
+              CMD="$CMD -f 'bestvideo[height<=1080]+bestaudio/best[height<=1080]'"
+              ;;
+            "720p")
+              CMD="$CMD -f 'bestvideo[height<=720]+bestaudio/best[height<=720]'"
+              ;;
+            "480p")
+              CMD="$CMD -f 'bestvideo[height<=480]+bestaudio/best[height<=480]'"
+              ;;
+            *)
+              CMD="$CMD -f bestvideo+bestaudio"
+              ;;
+          esac
+
+          # Subtitles
+          case "$SUBS" in
+            "fa")
+              CMD="$CMD --write-subs --sub-langs fa --embed-subs"
+              ;;
+            "en")
+              CMD="$CMD --write-subs --sub-langs en --embed-subs"
+              ;;
+            "both")
+              CMD="$CMD --write-subs --sub-langs fa,en --embed-subs"
+              ;;
+            *)
+              # no subtitles
+              ;;
+          esac
+
+          # Add playlist handling
+          CMD="$CMD --no-playlist-if-no-url \"$URL\""
+
+          # Execute
+          echo "Running: $CMD"
+          eval $CMD
+
+          # Get playlist or video metadata
           yt-dlp --flat-playlist --dump-single-json "$URL" > info.json
 
-          # Extract playlist title (if playlist) or video title
           PLAYLIST_TITLE=$(jq -r '.playlist_title // .title' info.json)
           echo "PLAYLIST_TITLE=$PLAYLIST_TITLE" >> $GITHUB_ENV
 
-          # Download with custom output template: video title as filename
-          yt-dlp -f bestvideo+bestaudio --merge-output-format mp4 \
-                 --restrict-filenames -o "%(title)s.%(ext)s" \
-                 --no-playlist-if-no-url "$URL"
+          # Count total videos in playlist (or 1 for single video)
+          VIDEO_COUNT=$(jq -r '.entries | length' info.json)
+          if [ "$VIDEO_COUNT" == "null" ] || [ -z "$VIDEO_COUNT" ]; then
+            VIDEO_COUNT=1
+          fi
+          echo "VIDEO_COUNT=$VIDEO_COUNT" >> $GITHUB_ENV
 
           echo "Download completed."
 
-      - name: Split large files into parts (max ${{ env.MAX_PART_SIZE_MB }} MB each)
+      - name: Split large files into parts (max ${{ env.MAX_PART_SIZE_MB }} MB each) with optional password
         run: |
           cd downloads
+          PASSWORD="${{ steps.params.outputs.password }}"
           for file in *.mp4; do
             if [ -f "$file" ]; then
               SIZE_MB=$(du -m "$file" | cut -f1)
               BASENAME="${file%.*}"
               if [ $SIZE_MB -gt ${{ env.MAX_PART_SIZE_MB }} ]; then
                 echo "File $file exceeds size limit, splitting..."
-                7z a -v${{ env.MAX_PART_SIZE_MB }}m "${BASENAME}.7z" "$file"
+                if [ -n "$PASSWORD" ]; then
+                  7z a -v${{ env.MAX_PART_SIZE_MB }}m -p"$PASSWORD" "${BASENAME}.7z" "$file"
+                else
+                  7z a -v${{ env.MAX_PART_SIZE_MB }}m "${BASENAME}.7z" "$file"
+                fi
                 rm "$file"
               else
                 echo "File $file is within limit, compressing with 7z..."
-                7z a "${BASENAME}.7z" "$file"
+                if [ -n "$PASSWORD" ]; then
+                  7z a -p"$PASSWORD" "${BASENAME}.7z" "$file"
+                else
+                  7z a "${BASENAME}.7z" "$file"
+                fi
                 rm "$file"
               fi
             fi
           done
-          # Now we have .7z and possibly .7z.001, .7z.002, etc.
 
       - name: Upload each part to Ufile.io and collect links
         id: upload
         run: |
           cd downloads
-          > upload_info.txt   # clear file
+          > upload_info.txt
           for archive in *.7z*; do
             if [ -f "$archive" ]; then
               echo "Uploading $archive ..."
               RESPONSE=$(curl -s -F "file=@$archive" ${{ env.UFILE_API }})
               LINK=$(echo "$RESPONSE" | jq -r '.data.url // empty')
               if [ -n "$LINK" ]; then
-                echo "$archive: $LINK" >> upload_info.txt
+                # Get file size
+                SIZE=$(du -h "$archive" | cut -f1)
+                echo "$archive (Size: $SIZE): $LINK" >> upload_info.txt
                 echo "✅ Uploaded: $LINK"
               else
                 echo "❌ Failed to upload $archive"
@@ -100,40 +197,47 @@ jobs:
               fi
             fi
           done
-          # Save the content for later use
+          # Save for later
           cat upload_info.txt
 
-      - name: Prepare email body (in English)
+      - name: Prepare email body (English) with full details
         id: email_body
         run: |
           cd downloads
-          # Get playlist title from env
           PLAYLIST_TITLE="${{ env.PLAYLIST_TITLE }}"
-          if [ -z "$PLAYLIST_TITLE" ]; then
-            PLAYLIST_TITLE="Unknown Title"
-          fi
-
-          # Count total files (parts)
+          VIDEO_COUNT="${{ env.VIDEO_COUNT }}"
           TOTAL_PARTS=$(wc -l < upload_info.txt)
+          PASSWORD="${{ steps.params.outputs.password }}"
+          QUALITY="${{ steps.params.outputs.quality }}"
+          SUBS="${{ steps.params.outputs.subs }}"
 
-          # Build email body
           BODY="Hello,\n\n"
           BODY+="Your YouTube download has been completed successfully.\n"
-          BODY+="Playlist / Video: $PLAYLIST_TITLE\n"
-          BODY+="Total parts uploaded: $TOTAL_PARTS\n\n"
-          BODY+="Download links (each part is a separate file):\n\n"
+          BODY+="--------------------------------------------------\n"
+          BODY+="📌 Playlist / Video Title: $PLAYLIST_TITLE\n"
+          BODY+="📂 Number of videos: $VIDEO_COUNT\n"
+          BODY+="📦 Total parts uploaded: $TOTAL_PARTS\n"
+          BODY+="🎬 Quality: $QUALITY\n"
+          BODY+="🔤 Subtitles: $SUBS\n"
+          if [ -n "$PASSWORD" ]; then
+            BODY+="🔒 Password: $PASSWORD (required to extract the archives)\n"
+          else
+            BODY+="🔓 No password (archives are not encrypted)\n"
+          fi
+          BODY+="--------------------------------------------------\n\n"
+          BODY+="🔗 Download links (each line is a separate file/part):\n\n"
           while IFS= read -r line; do
             BODY+="$line\n"
           done < upload_info.txt
-          BODY+="\nThese links are valid for 30 days.\n\n"
+          BODY+="\n⏳ These links are valid for 30 days.\n"
+          BODY+="💡 To extract: If you have multiple parts (e.g., .7z.001, .7z.002), use:\n"
+          BODY+="   7z x file.7z.001 -pPASSWORD (if password set)\n\n"
           BODY+="Regards,\nYouTube Downloader Bot"
 
-          # Write body to file for later use
           echo -e "$BODY" > email_body.txt
-          # Also store as output for debug
           cat email_body.txt
 
-      - name: Send email with download links (English)
+      - name: Send email with download links
         uses: dawidd6/action-send-mail@v3
         with:
           server_address: smtp.gmail.com
@@ -143,18 +247,17 @@ jobs:
           subject: '✅ YouTube Download: ${{ env.PLAYLIST_TITLE }}'
           to: ${{ env.RECIPIENT_EMAIL }}
           from: YouTube Downloader
-          body: ${{ steps.email_body.outputs.body }}   # Not directly possible, we need to use file
-          # Instead, we can use a file input
-          # The action supports 'body_file' input to read from file
           body_file: downloads/email_body.txt
 
       - name: Clean up local files
         run: rm -rf downloads
 
-      - name: Close the issue (if started from issue)
+      - name: Close the issue (if triggered by issue)
         if: github.event_name == 'issues'
         uses: peter-evans/close-issue@v3
         with:
           comment: |
             ✅ Download and upload completed successfully.
-            Download links have been sent to your email address.
+            All download links have been sent to your email address.
+            Playlist/Video: ${{ env.PLAYLIST_TITLE }}
+            Total parts: (see email)
