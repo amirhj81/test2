@@ -48,10 +48,6 @@ env:
   EMAIL_USERNAME: ${{ secrets.EMAIL_USERNAME }}
   EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
 
-  # YouTube cookies for bypassing restrictions (optional but recommended)
-  # Add YOUTUBE_COOKIE_1, YOUTUBE_COOKIE_2, etc. as secrets
-  COOKIE_COUNT: 3
-
 jobs:
   download-and-upload:
     runs-on: ubuntu-latest
@@ -71,36 +67,44 @@ jobs:
           sudo apt-get install -y python3-pip p7zip-full jq curl bc ffmpeg
           pip3 install --upgrade yt-dlp
 
+          # Install deno - REQUIRED for yt-dlp YouTube extraction in 2026
+          echo "Installing deno JavaScript runtime..."
+          curl -fsSL https://deno.land/install.sh | sh
+          export DENO_INSTALL="$HOME/.deno"
+          export PATH="$DENO_INSTALL/bin:$PATH"
+          echo "$DENO_INSTALL/bin" >> $GITHUB_PATH
+          deno --version
+
       - name: Start Cloudflare WARP proxy
         run: |
           echo "Starting Cloudflare WARP to bypass YouTube IP blocking..."
           docker network create warp-net 2>/dev/null || true
+
           docker run -d \
             --name warp \
             --restart=always \
             --network warp-net \
             -p 127.0.0.1:1080:1080 \
             --cap-add NET_ADMIN \
+            --cap-add MKNOD \
+            --cap-add AUDIT_WRITE \
             --sysctl net.ipv6.conf.all.disable_ipv6=0 \
             --sysctl net.ipv4.conf.all.src_valid_mark=1 \
-            ghcr.io/kingcc/warproxy:latest
+            -v warp-data:/var/lib/cloudflare-warp \
+            caomingjun/warp
 
-          echo "Waiting for WARP to initialize..."
-          sleep 15
-
-          # Verify WARP is working
-          for i in {1..10}; do
+          echo "Waiting for WARP to initialize (up to 60 seconds)..."
+          for i in {1..12}; do
             RESULT=$(curl -s --max-time 5 --socks5-hostname 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace 2>/dev/null || echo "failed")
             if echo "$RESULT" | grep -qE "warp=(on|plus)"; then
               echo "WARP is active!"
               echo "$RESULT"
               break
             fi
-            echo "Attempt $i/10 - WARP not ready yet, waiting..."
+            echo "Attempt $i/12 - WARP not ready yet, waiting..."
             sleep 5
           done
 
-          # Show current IP
           echo "Current IP through WARP:"
           curl -s --socks5-hostname 127.0.0.1:1080 https://ipinfo.io/ip 2>/dev/null || echo "Could not get IP"
 
@@ -150,6 +154,13 @@ jobs:
 
       - name: Download YouTube video(s) - Multi-method bypass
         id: download
+        env:
+          # Map cookies from secrets to env vars
+          YT_COOKIE_1: ${{ secrets.YOUTUBE_COOKIE_1 }}
+          YT_COOKIE_2: ${{ secrets.YOUTUBE_COOKIE_2 }}
+          YT_COOKIE_3: ${{ secrets.YOUTUBE_COOKIE_3 }}
+          YT_COOKIE_4: ${{ secrets.YOUTUBE_COOKIE_4 }}
+          YT_COOKIE_5: ${{ secrets.YOUTUBE_COOKIE_5 }}
         run: |
           mkdir -p downloads
           cd downloads
@@ -159,18 +170,22 @@ jobs:
           QUALITY="${{ steps.params.outputs.quality }}"
           SUBS="${{ steps.params.outputs.subs }}"
           PASSWORD="${{ steps.params.outputs.password }}"
-          COOKIE_COUNT="${{ env.COOKIE_COUNT }}"
 
-          # Load cookies from secrets
-          for i in $(seq 1 $COOKIE_COUNT); do
-            COOKIE_VAR="YOUTUBE_COOKIE_$i"
+          # Add deno to PATH
+          export PATH="$HOME/.deno/bin:$PATH"
+          deno --version
+
+          # Load cookies from env vars (fixed method)
+          COOKIE_LOADED=0
+          for i in 1 2 3 4 5; do
+            COOKIE_VAR="YT_COOKIE_$i"
             COOKIE_VALUE="${!COOKIE_VAR}"
             if [ -n "$COOKIE_VALUE" ]; then
               echo "$COOKIE_VALUE" > "cookie_$i.txt"
+              COOKIE_LOADED=$((COOKIE_LOADED + 1))
               echo "Loaded cookie $i"
             fi
           done
-          COOKIE_LOADED=$(ls cookie_*.txt 2>/dev/null | wc -l)
           echo "Loaded $COOKIE_LOADED cookies"
 
           # Build quality/format options
@@ -199,19 +214,19 @@ jobs:
             *)      SUB_OPTS="" ;;
           esac
 
-          # Base options with WARP proxy
+          # Base options with WARP proxy and deno
           BASE_OPTS="--proxy socks5://127.0.0.1:1080"
           BASE_OPTS="$BASE_OPTS --no-cache-dir --retries 5 --fragment-retries 5"
           BASE_OPTS="$BASE_OPTS --no-check-certificates --concurrent-fragments 8"
           BASE_OPTS="$BASE_OPTS --buffer-size 16K --http-chunk-size 10M"
           BASE_OPTS="$BASE_OPTS --progress --newline"
           BASE_OPTS="$BASE_OPTS --restrict-filenames"
+          BASE_OPTS="$BASE_OPTS --js-runtimes deno"
 
           # Function to try multiple download methods
           download_with_methods() {
             local URL=$1
-            local OUTPUT=$2
-            local IS_PLAYLIST=$3
+            local IS_PLAYLIST=$2
 
             if [ "$IS_PLAYLIST" = "true" ]; then
               OUTPUT_PATTERN="%(playlist_index)03d - %(title)s.%(ext)s"
@@ -219,12 +234,12 @@ jobs:
               OUTPUT_PATTERN="%(title)s.%(ext)s"
             fi
 
-            # Method 1: WARP proxy + web client + cookies
-            echo "Trying Method 1: WARP + web client + cookies..."
+            # Method 1: WARP + web client + cookies + deno (2026 silver bullet)
+            echo "Trying Method 1: WARP + web client + cookies + deno..."
             if [ "$COOKIE_LOADED" -gt 0 ]; then
               COOKIE_FILE="cookie_$((RANDOM % COOKIE_LOADED + 1)).txt"
               yt-dlp $BASE_OPTS --cookies "$COOKIE_FILE" \
-                --extractor-args "youtube:player_client=web" \
+                --extractor-args "youtube:player_client=web,-android_sdkless" \
                 --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" \
                 --add-header "Accept-Language:en-US,en;q=0.9" \
                 -f "$FORMAT" $AUDIO_OPTS $SUB_OPTS \
@@ -232,8 +247,18 @@ jobs:
                 "$URL" && return 0
             fi
 
-            # Method 2: WARP + mweb client
-            echo "Trying Method 2: WARP + mweb client..."
+            # Method 2: WARP + web client + deno (no cookies)
+            echo "Trying Method 2: WARP + web client + deno (no cookies)..."
+            yt-dlp $BASE_OPTS \
+              --extractor-args "youtube:player_client=web,-android_sdkless" \
+              --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" \
+              --add-header "Accept-Language:en-US,en;q=0.9" \
+              -f "$FORMAT" $AUDIO_OPTS $SUB_OPTS \
+              -o "$OUTPUT_PATTERN" \
+              "$URL" && return 0
+
+            # Method 3: WARP + mweb client
+            echo "Trying Method 3: WARP + mweb client..."
             yt-dlp $BASE_OPTS \
               --extractor-args "youtube:player_client=mweb" \
               --user-agent "Mozilla/5.0 (Linux; Android 10; SM-G981B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/80.0.3987.162 Mobile Safari/537.36" \
@@ -241,8 +266,8 @@ jobs:
               -o "$OUTPUT_PATTERN" \
               "$URL" && return 0
 
-            # Method 3: WARP + android client
-            echo "Trying Method 3: WARP + android client..."
+            # Method 4: WARP + android client
+            echo "Trying Method 4: WARP + android client..."
             yt-dlp $BASE_OPTS \
               --extractor-args "youtube:player_client=android" \
               --user-agent "Mozilla/5.0 (Linux; Android 12; SM-S906N Build/QP1A.190711.020) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36" \
@@ -250,16 +275,16 @@ jobs:
               -o "$OUTPUT_PATTERN" \
               "$URL" && return 0
 
-            # Method 4: WARP + tv client
-            echo "Trying Method 4: WARP + tv client..."
+            # Method 5: WARP + tv client
+            echo "Trying Method 5: WARP + tv client..."
             yt-dlp $BASE_OPTS \
               --extractor-args "youtube:player_client=tv" \
               -f "$FORMAT" $AUDIO_OPTS $SUB_OPTS \
               -o "$OUTPUT_PATTERN" \
               "$URL" && return 0
 
-            # Method 5: WARP + ios client
-            echo "Trying Method 5: WARP + ios client..."
+            # Method 6: WARP + ios client
+            echo "Trying Method 6: WARP + ios client..."
             yt-dlp $BASE_OPTS \
               --extractor-args "youtube:player_client=ios" \
               --user-agent "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1" \
@@ -286,7 +311,7 @@ jobs:
               echo "Detected as PLAYLIST"
             fi
 
-            if ! download_with_methods "$URL" "downloads" "$IS_PLAYLIST"; then
+            if ! download_with_methods "$URL" "$IS_PLAYLIST"; then
               echo "WARNING: Failed to download $URL"
             fi
           done
@@ -299,39 +324,82 @@ jobs:
           echo "Download completed. Files:"
           ls -lh
 
-      - name: Package files (3GB max per archive)
+      - name: Package files into 3GB archives
         run: |
           cd downloads
           PASSWORD="${{ steps.params.outputs.password }}"
           FORMAT_EXT="${{ env.FORMAT_EXT }}"
           MAX_SIZE_MB=3072
+          MAX_SIZE_BYTES=$((MAX_SIZE_MB * 1024 * 1024))
 
+          # Collect all video files
+          ALL_FILES=()
           for file in *.$FORMAT_EXT; do
-            if [ -f "$file" ]; then
-              SIZE_MB=$(du -m "$file" | cut -f1)
-              BASENAME="${file%.*}"
+            [ -f "$file" ] && ALL_FILES+=("$file")
+          done
 
-              if [ $SIZE_MB -gt $MAX_SIZE_MB ]; then
-                echo "File $file exceeds 3GB, splitting..."
-                if [ -n "$PASSWORD" ]; then
-                  7z a -v${MAX_SIZE_MB}m -p"$PASSWORD" "${BASENAME}.7z" "$file"
-                else
-                  7z a -v${MAX_SIZE_MB}m "${BASENAME}.7z" "$file"
-                fi
+          echo "Total video files: ${#ALL_FILES[@]}"
+
+          if [ ${#ALL_FILES[@]} -eq 0 ]; then
+            echo "No files to package!"
+            exit 1
+          fi
+
+          # Package into 3GB archives
+          PKG_INDEX=0
+          CURRENT_PKG_FILES=()
+          CURRENT_PKG_SIZE=0
+
+          for VID_FILE in "${ALL_FILES[@]}"; do
+            FSIZE=$(stat -c%s "$VID_FILE" 2>/dev/null || echo 0)
+
+            if [ $CURRENT_PKG_SIZE -gt 0 ] && [ $((CURRENT_PKG_SIZE + FSIZE)) -gt $MAX_SIZE_BYTES ]; then
+              PKG_INDEX=$((PKG_INDEX + 1))
+              PKG_NAME="package_$(printf '%03d' $PKG_INDEX)"
+
+              echo "Creating $PKG_NAME.7z (${#CURRENT_PKG_FILES[@]} files, $(echo "scale=1; $CURRENT_PKG_SIZE/1024/1024/1024" | bc)GB)..."
+
+              if [ -n "$PASSWORD" ]; then
+                7z a -t7z -p"$PASSWORD" -mx=3 "$PKG_NAME.7z" ${CURRENT_PKG_FILES[@]}
               else
-                echo "Compressing $file with 7z..."
-                if [ -n "$PASSWORD" ]; then
-                  7z a -p"$PASSWORD" "${BASENAME}.7z" "$file"
-                else
-                  7z a "${BASENAME}.7z" "$file"
-                fi
+                7z a -t7z -mx=3 "$PKG_NAME.7z" ${CURRENT_PKG_FILES[@]}
               fi
-              rm "$file"
+
+              if [ -f "$PKG_NAME.7z" ]; then
+                echo "Created: $PKG_NAME.7z ($(stat -c%s "$PKG_NAME.7z" | numfmt --to=iec))"
+              fi
+
+              CURRENT_PKG_FILES=("$VID_FILE")
+              CURRENT_PKG_SIZE=$FSIZE
+            else
+              CURRENT_PKG_FILES+=("$VID_FILE")
+              CURRENT_PKG_SIZE=$((CURRENT_PKG_SIZE + FSIZE))
             fi
           done
 
+          # Package remaining files
+          if [ ${#CURRENT_PKG_FILES[@]} -gt 0 ]; then
+            PKG_INDEX=$((PKG_INDEX + 1))
+            PKG_NAME="package_$(printf '%03d' $PKG_INDEX)"
+
+            echo "Creating final $PKG_NAME.7z (${#CURRENT_PKG_FILES[@]} files, $(echo "scale=1; $CURRENT_PKG_SIZE/1024/1024/1024" | bc)GB)..."
+
+            if [ -n "$PASSWORD" ]; then
+              7z a -t7z -p"$PASSWORD" -mx=3 "$PKG_NAME.7z" ${CURRENT_PKG_FILES[@]}
+            else
+              7z a -t7z -mx=3 "$PKG_NAME.7z" ${CURRENT_PKG_FILES[@]}
+            fi
+
+            if [ -f "$PKG_NAME.7z" ]; then
+              echo "Created: $PKG_NAME.7z ($(stat -c%s "$PKG_NAME.7z" | numfmt --to=iec))"
+            fi
+          fi
+
+          # Remove original video files, keep only archives
+          rm -f *.${FORMAT_EXT}
+
           echo "Packaging completed. Archives:"
-          ls -lh *.7z* 2>/dev/null || echo "No archives found"
+          ls -lh *.7z 2>/dev/null || echo "No archives found"
 
       - name: Upload to Ufile.io
         id: upload
@@ -339,7 +407,7 @@ jobs:
           cd downloads
           > upload_info.txt
 
-          for archive in *.7z*; do
+          for archive in *.7z; do
             if [ -f "$archive" ]; then
               echo "Uploading $archive to Ufile.io..."
 
@@ -352,14 +420,17 @@ jobs:
 
               if [ -z "$FUID" ]; then
                 echo "Failed to create session for $archive"
+                echo "Response: $SESSION"
                 continue
               fi
 
+              echo "Session created, fuid: $FUID"
+
               # Step 2: Upload chunk
-              curl -s -X POST "https://up.ufile.io/v1/upload/chunk" \
+              CHUNK_RESP=$(curl -s -X POST "https://up.ufile.io/v1/upload/chunk" \
                 -F "chunk_index=0" \
                 -F "fuid=$FUID" \
-                -F "file=@$archive" > /dev/null
+                -F "file=@$archive")
 
               # Step 3: Finalise
               FINAL=$(curl -s -X POST "https://up.ufile.io/v1/upload/finalise" \
@@ -376,6 +447,7 @@ jobs:
                 echo "Uploaded: $LINK"
               else
                 echo "Failed to upload $archive"
+                echo "Finalise response: $FINAL"
               fi
             fi
           done
@@ -392,14 +464,14 @@ jobs:
           SUBS="${{ steps.params.outputs.subs }}"
 
           cat > email_body.txt << EOF
-Hello,
+            Hello,
 
-Your YouTube download has been completed successfully.
---------------------------------------------------
-Total parts uploaded: $TOTAL_PARTS
-Quality: $QUALITY
-Subtitles: $SUBS
-EOF
+            Your YouTube download has been completed.
+            --------------------------------------------------
+            Total parts uploaded: $TOTAL_PARTS
+            Quality: $QUALITY
+            Subtitles: $SUBS
+          EOF
 
           if [ -n "$PASSWORD" ]; then
             echo "Password: $PASSWORD (required to extract archives)" >> email_body.txt
@@ -410,7 +482,7 @@ EOF
           cat >> email_body.txt << EOF
 --------------------------------------------------
 
-Download links (each line is a separate file/part):
+Download links:
 
 EOF
 
@@ -420,11 +492,11 @@ EOF
 
           cat >> email_body.txt << EOF
 
-These links are valid for 30 days on Ufile.io.
-To extract: If you have multiple parts (e.g., .7z.001, .7z.002), use:
-   7z x file.7z.001 -pPASSWORD (if password set)
+Notes:
+- Links valid for 30 days on Ufile.io
+- Download as soon as possible
+- To extract: 7z x package.7z -pPASSWORD (if password set)
 
-Regards,
 YouTube Downloader Bot
 EOF
 
@@ -456,6 +528,7 @@ EOF
         run: |
           docker stop warp 2>/dev/null || true
           docker rm warp 2>/dev/null || true
+          docker network rm warp-net 2>/dev/null || true
 
       - name: Clean up local files
         if: always()
@@ -466,5 +539,5 @@ EOF
         uses: peter-evans/close-issue@v3
         with:
           comment: |
-            Download and upload completed successfully.
+            Download and upload completed.
             All download links have been sent to your email address.
