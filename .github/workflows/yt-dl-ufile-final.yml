@@ -1,0 +1,470 @@
+name: Download YouTube & Upload to Ufile
+
+on:
+  issues:
+    types: [opened]
+  workflow_dispatch:
+    inputs:
+      youtube_urls:
+        description: 'YouTube video or playlist URL(s) - space separated'
+        required: true
+        default: 'https://www.youtube.com/watch?v=...'
+      quality:
+        description: 'Video quality'
+        required: false
+        default: 'best'
+        type: choice
+        options:
+          - best
+          - 2160
+          - 1440
+          - 1080
+          - 720
+          - 480
+          - audio
+      subtitles:
+        description: 'Subtitles language'
+        required: false
+        default: 'none'
+        type: choice
+        options:
+          - none
+          - fa
+          - en
+          - both
+      password:
+        description: 'Password for 7z archive (leave empty for no password)'
+        required: false
+        default: ''
+        type: string
+      email:
+        description: 'Email to send links to (optional, defaults to GitHub account email)'
+        required: false
+        default: ''
+        type: string
+
+env:
+  # Email settings - add EMAIL_USERNAME and EMAIL_PASSWORD to GitHub Secrets
+  EMAIL_USERNAME: ${{ secrets.EMAIL_USERNAME }}
+  EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+
+  # YouTube cookies for bypassing restrictions (optional but recommended)
+  # Add YOUTUBE_COOKIE_1, YOUTUBE_COOKIE_2, etc. as secrets
+  COOKIE_COUNT: 3
+
+jobs:
+  download-and-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.issue.title, 'youtube') || contains(github.event.issue.title, 'YouTube')
+    permissions:
+      contents: read
+      issues: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install required tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-pip p7zip-full jq curl bc ffmpeg
+          pip3 install --upgrade yt-dlp
+
+      - name: Start Cloudflare WARP proxy
+        run: |
+          echo "Starting Cloudflare WARP to bypass YouTube IP blocking..."
+          docker network create warp-net 2>/dev/null || true
+          docker run -d \
+            --name warp \
+            --restart=always \
+            --network warp-net \
+            -p 127.0.0.1:1080:1080 \
+            --cap-add NET_ADMIN \
+            --sysctl net.ipv6.conf.all.disable_ipv6=0 \
+            --sysctl net.ipv4.conf.all.src_valid_mark=1 \
+            ghcr.io/kingcc/warproxy:latest
+
+          echo "Waiting for WARP to initialize..."
+          sleep 15
+
+          # Verify WARP is working
+          for i in {1..10}; do
+            RESULT=$(curl -s --max-time 5 --socks5-hostname 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace 2>/dev/null || echo "failed")
+            if echo "$RESULT" | grep -qE "warp=(on|plus)"; then
+              echo "WARP is active!"
+              echo "$RESULT"
+              break
+            fi
+            echo "Attempt $i/10 - WARP not ready yet, waiting..."
+            sleep 5
+          done
+
+          # Show current IP
+          echo "Current IP through WARP:"
+          curl -s --socks5-hostname 127.0.0.1:1080 https://ipinfo.io/ip 2>/dev/null || echo "Could not get IP"
+
+      - name: Extract parameters
+        id: params
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            URLS_RAW="${{ github.event.inputs.youtube_urls }}"
+            QUALITY="${{ github.event.inputs.quality }}"
+            SUBS="${{ github.event.inputs.subtitles }}"
+            PASSWORD="${{ github.event.inputs.password }}"
+            EMAIL_INPUT="${{ github.event.inputs.email }}"
+          else
+            BODY="${{ github.event.issue.body }}"
+            URL=$(echo "$BODY" | grep -oP 'https?://(www\.)?(youtube\.com|youtu\.be)/[^\s]+' | head -1)
+            URLS_RAW="$URL"
+            QUALITY=$(echo "$BODY" | grep -i 'quality:' | sed 's/.*quality:\s*//i' | tr -d ' ' | head -1)
+            QUALITY=${QUALITY:-best}
+            SUBS=$(echo "$BODY" | grep -i 'subs:' | sed 's/.*subs:\s*//i' | tr -d ' ' | head -1)
+            SUBS=${SUBS:-none}
+            PASSWORD=$(echo "$BODY" | grep -i 'password:' | sed 's/.*password:\s*//i' | head -1)
+            EMAIL_INPUT=""
+          fi
+
+          echo "urls=$URLS_RAW" >> $GITHUB_OUTPUT
+          echo "quality=$QUALITY" >> $GITHUB_OUTPUT
+          echo "subs=$SUBS" >> $GITHUB_OUTPUT
+          echo "password=$PASSWORD" >> $GITHUB_OUTPUT
+          echo "email_input=$EMAIL_INPUT" >> $GITHUB_OUTPUT
+          echo "URLs: $URLS_RAW"
+          echo "Quality: $QUALITY"
+          echo "Subs: $SUBS"
+
+      - name: Get recipient email
+        id: get_email
+        run: |
+          EMAIL="${{ steps.params.outputs.email_input }}"
+          if [ -z "$EMAIL" ]; then
+            EMAIL=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              "https://api.github.com/user/emails" | jq -r '.[] | select(.primary==true) | .email')
+          fi
+          if [ -z "$EMAIL" ] || [ "$EMAIL" = "null" ]; then
+            EMAIL="${{ github.actor }}@users.noreply.github.com"
+          fi
+          echo "email=$EMAIL" >> $GITHUB_OUTPUT
+          echo "Recipient email: $EMAIL"
+
+      - name: Download YouTube video(s) - Multi-method bypass
+        id: download
+        run: |
+          mkdir -p downloads
+          cd downloads
+
+          URLS_RAW="${{ steps.params.outputs.urls }}"
+          read -ra URL_LIST <<< "$URLS_RAW"
+          QUALITY="${{ steps.params.outputs.quality }}"
+          SUBS="${{ steps.params.outputs.subs }}"
+          PASSWORD="${{ steps.params.outputs.password }}"
+          COOKIE_COUNT="${{ env.COOKIE_COUNT }}"
+
+          # Load cookies from secrets
+          for i in $(seq 1 $COOKIE_COUNT); do
+            COOKIE_VAR="YOUTUBE_COOKIE_$i"
+            COOKIE_VALUE="${!COOKIE_VAR}"
+            if [ -n "$COOKIE_VALUE" ]; then
+              echo "$COOKIE_VALUE" > "cookie_$i.txt"
+              echo "Loaded cookie $i"
+            fi
+          done
+          COOKIE_LOADED=$(ls cookie_*.txt 2>/dev/null | wc -l)
+          echo "Loaded $COOKIE_LOADED cookies"
+
+          # Build quality/format options
+          if [ "$QUALITY" == "audio" ]; then
+            FORMAT="bestaudio/bestaudio*/best"
+            FORMAT_EXT="mp3"
+            AUDIO_OPTS="-x --audio-format mp3 --audio-quality 0"
+          else
+            case "$QUALITY" in
+              "2160") FORMAT="bestvideo[height<=2160]+bestaudio/best" ;;
+              "1440") FORMAT="bestvideo[height<=1440]+bestaudio/best" ;;
+              "1080") FORMAT="bestvideo[height<=1080]+bestaudio/best" ;;
+              "720")  FORMAT="bestvideo[height<=720]+bestaudio/best" ;;
+              "480")  FORMAT="bestvideo[height<=480]+bestaudio/best" ;;
+              *)      FORMAT="bestvideo+bestaudio/best" ;;
+            esac
+            FORMAT_EXT="mp4"
+            AUDIO_OPTS=""
+          fi
+
+          # Subtitle options
+          case "$SUBS" in
+            "fa")   SUB_OPTS="--write-subs --sub-langs fa --embed-subs" ;;
+            "en")   SUB_OPTS="--write-subs --sub-langs en --embed-subs" ;;
+            "both") SUB_OPTS="--write-subs --sub-langs fa,en --embed-subs" ;;
+            *)      SUB_OPTS="" ;;
+          esac
+
+          # Base options with WARP proxy
+          BASE_OPTS="--proxy socks5://127.0.0.1:1080"
+          BASE_OPTS="$BASE_OPTS --no-cache-dir --retries 5 --fragment-retries 5"
+          BASE_OPTS="$BASE_OPTS --no-check-certificates --concurrent-fragments 8"
+          BASE_OPTS="$BASE_OPTS --buffer-size 16K --http-chunk-size 10M"
+          BASE_OPTS="$BASE_OPTS --progress --newline"
+          BASE_OPTS="$BASE_OPTS --restrict-filenames"
+
+          # Function to try multiple download methods
+          download_with_methods() {
+            local URL=$1
+            local OUTPUT=$2
+            local IS_PLAYLIST=$3
+
+            if [ "$IS_PLAYLIST" = "true" ]; then
+              OUTPUT_PATTERN="%(playlist_index)03d - %(title)s.%(ext)s"
+            else
+              OUTPUT_PATTERN="%(title)s.%(ext)s"
+            fi
+
+            # Method 1: WARP proxy + web client + cookies
+            echo "Trying Method 1: WARP + web client + cookies..."
+            if [ "$COOKIE_LOADED" -gt 0 ]; then
+              COOKIE_FILE="cookie_$((RANDOM % COOKIE_LOADED + 1)).txt"
+              yt-dlp $BASE_OPTS --cookies "$COOKIE_FILE" \
+                --extractor-args "youtube:player_client=web" \
+                --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" \
+                --add-header "Accept-Language:en-US,en;q=0.9" \
+                -f "$FORMAT" $AUDIO_OPTS $SUB_OPTS \
+                -o "$OUTPUT_PATTERN" \
+                "$URL" && return 0
+            fi
+
+            # Method 2: WARP + mweb client
+            echo "Trying Method 2: WARP + mweb client..."
+            yt-dlp $BASE_OPTS \
+              --extractor-args "youtube:player_client=mweb" \
+              --user-agent "Mozilla/5.0 (Linux; Android 10; SM-G981B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/80.0.3987.162 Mobile Safari/537.36" \
+              -f "$FORMAT" $AUDIO_OPTS $SUB_OPTS \
+              -o "$OUTPUT_PATTERN" \
+              "$URL" && return 0
+
+            # Method 3: WARP + android client
+            echo "Trying Method 3: WARP + android client..."
+            yt-dlp $BASE_OPTS \
+              --extractor-args "youtube:player_client=android" \
+              --user-agent "Mozilla/5.0 (Linux; Android 12; SM-S906N Build/QP1A.190711.020) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36" \
+              -f "$FORMAT" $AUDIO_OPTS $SUB_OPTS \
+              -o "$OUTPUT_PATTERN" \
+              "$URL" && return 0
+
+            # Method 4: WARP + tv client
+            echo "Trying Method 4: WARP + tv client..."
+            yt-dlp $BASE_OPTS \
+              --extractor-args "youtube:player_client=tv" \
+              -f "$FORMAT" $AUDIO_OPTS $SUB_OPTS \
+              -o "$OUTPUT_PATTERN" \
+              "$URL" && return 0
+
+            # Method 5: WARP + ios client
+            echo "Trying Method 5: WARP + ios client..."
+            yt-dlp $BASE_OPTS \
+              --extractor-args "youtube:player_client=ios" \
+              --user-agent "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1" \
+              -f "$FORMAT" $AUDIO_OPTS $SUB_OPTS \
+              -o "$OUTPUT_PATTERN" \
+              "$URL" && return 0
+
+            echo "All methods failed for: $URL"
+            return 1
+          }
+
+          # Process each URL
+          URL_INDEX=0
+          for URL in "${URL_LIST[@]}"; do
+            URL_INDEX=$((URL_INDEX + 1))
+            echo ""
+            echo "============================================================"
+            echo "Processing URL $URL_INDEX : $URL"
+            echo "============================================================"
+
+            IS_PLAYLIST=false
+            if echo "$URL" | grep -qiE "playlist\?list="; then
+              IS_PLAYLIST=true
+              echo "Detected as PLAYLIST"
+            fi
+
+            if ! download_with_methods "$URL" "downloads" "$IS_PLAYLIST"; then
+              echo "WARNING: Failed to download $URL"
+            fi
+          done
+
+          # Cleanup cookies
+          rm -f cookie_*.txt
+
+          # Save metadata
+          echo "FORMAT_EXT=$FORMAT_EXT" >> $GITHUB_ENV
+          echo "Download completed. Files:"
+          ls -lh
+
+      - name: Package files (3GB max per archive)
+        run: |
+          cd downloads
+          PASSWORD="${{ steps.params.outputs.password }}"
+          FORMAT_EXT="${{ env.FORMAT_EXT }}"
+          MAX_SIZE_MB=3072
+
+          for file in *.$FORMAT_EXT; do
+            if [ -f "$file" ]; then
+              SIZE_MB=$(du -m "$file" | cut -f1)
+              BASENAME="${file%.*}"
+
+              if [ $SIZE_MB -gt $MAX_SIZE_MB ]; then
+                echo "File $file exceeds 3GB, splitting..."
+                if [ -n "$PASSWORD" ]; then
+                  7z a -v${MAX_SIZE_MB}m -p"$PASSWORD" "${BASENAME}.7z" "$file"
+                else
+                  7z a -v${MAX_SIZE_MB}m "${BASENAME}.7z" "$file"
+                fi
+              else
+                echo "Compressing $file with 7z..."
+                if [ -n "$PASSWORD" ]; then
+                  7z a -p"$PASSWORD" "${BASENAME}.7z" "$file"
+                else
+                  7z a "${BASENAME}.7z" "$file"
+                fi
+              fi
+              rm "$file"
+            fi
+          done
+
+          echo "Packaging completed. Archives:"
+          ls -lh *.7z* 2>/dev/null || echo "No archives found"
+
+      - name: Upload to Ufile.io
+        id: upload
+        run: |
+          cd downloads
+          > upload_info.txt
+
+          for archive in *.7z*; do
+            if [ -f "$archive" ]; then
+              echo "Uploading $archive to Ufile.io..."
+
+              FSIZE=$(stat -c%s "$archive")
+              EXT="${archive##*.}"
+
+              # Step 1: Create session
+              SESSION=$(curl -s -X POST "https://up.ufile.io/v1/upload/create_session" -d "file_size=$FSIZE")
+              FUID=$(echo "$SESSION" | jq -r '.fuid // empty')
+
+              if [ -z "$FUID" ]; then
+                echo "Failed to create session for $archive"
+                continue
+              fi
+
+              # Step 2: Upload chunk
+              curl -s -X POST "https://up.ufile.io/v1/upload/chunk" \
+                -F "chunk_index=0" \
+                -F "fuid=$FUID" \
+                -F "file=@$archive" > /dev/null
+
+              # Step 3: Finalise
+              FINAL=$(curl -s -X POST "https://up.ufile.io/v1/upload/finalise" \
+                -d "fuid=$FUID" \
+                -d "file_name=$archive" \
+                -d "file_type=$EXT" \
+                -d "total_chunks=1")
+
+              LINK=$(echo "$FINAL" | jq -r '.url // empty')
+
+              if [ -n "$LINK" ] && [ "$LINK" != "null" ]; then
+                SIZE=$(du -h "$archive" | cut -f1)
+                echo "$archive (Size: $SIZE): $LINK" >> upload_info.txt
+                echo "Uploaded: $LINK"
+              else
+                echo "Failed to upload $archive"
+              fi
+            fi
+          done
+
+          cat upload_info.txt
+
+      - name: Prepare email body
+        id: email_body
+        run: |
+          cd downloads
+          TOTAL_PARTS=$(wc -l < upload_info.txt 2>/dev/null || echo 0)
+          PASSWORD="${{ steps.params.outputs.password }}"
+          QUALITY="${{ steps.params.outputs.quality }}"
+          SUBS="${{ steps.params.outputs.subs }}"
+
+          cat > email_body.txt << EOF
+Hello,
+
+Your YouTube download has been completed successfully.
+--------------------------------------------------
+Total parts uploaded: $TOTAL_PARTS
+Quality: $QUALITY
+Subtitles: $SUBS
+EOF
+
+          if [ -n "$PASSWORD" ]; then
+            echo "Password: $PASSWORD (required to extract archives)" >> email_body.txt
+          else
+            echo "No password (archives are not encrypted)" >> email_body.txt
+          fi
+
+          cat >> email_body.txt << EOF
+--------------------------------------------------
+
+Download links (each line is a separate file/part):
+
+EOF
+
+          while IFS= read -r line; do
+            echo "$line" >> email_body.txt
+          done < upload_info.txt
+
+          cat >> email_body.txt << EOF
+
+These links are valid for 30 days on Ufile.io.
+To extract: If you have multiple parts (e.g., .7z.001, .7z.002), use:
+   7z x file.7z.001 -pPASSWORD (if password set)
+
+Regards,
+YouTube Downloader Bot
+EOF
+
+          cat email_body.txt
+
+      - name: Send email with download links
+        if: env.EMAIL_USERNAME != '' && env.EMAIL_PASSWORD != ''
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: 'YouTube Download Complete'
+          to: ${{ steps.get_email.outputs.email }}
+          from: YouTube Downloader
+          body: file://downloads/email_body.txt
+
+      - name: Send email fallback
+        if: env.EMAIL_USERNAME == '' || env.EMAIL_PASSWORD == ''
+        run: |
+          echo "Email credentials not configured in secrets."
+          echo "Please add EMAIL_USERNAME and EMAIL_PASSWORD to GitHub Secrets."
+          echo "Email would have been sent to: ${{ steps.get_email.outputs.email }}"
+
+      - name: Stop WARP container
+        if: always()
+        run: |
+          docker stop warp 2>/dev/null || true
+          docker rm warp 2>/dev/null || true
+
+      - name: Clean up local files
+        if: always()
+        run: rm -rf downloads
+
+      - name: Close the issue (if triggered by issue)
+        if: github.event_name == 'issues'
+        uses: peter-evans/close-issue@v3
+        with:
+          comment: |
+            Download and upload completed successfully.
+            All download links have been sent to your email address.
